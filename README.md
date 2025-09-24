@@ -1,6 +1,6 @@
 # staking-cli
 
-A CLI tool to interact with Monad's staking contract and execute operations by interacting with it.
+A CLI tool to interact with Monad's staking contract and execute operations by interacting with it. It's **highly** recommended to review the official staking documentation: [overview](https://docs.monad.xyz/developer-essentials/staking/staking-behavior) and [deeper dive](https://docs.monad.xyz/developer-essentials/staking/staking-precompile) on supported functionality.
 
 ## Features
 
@@ -81,7 +81,9 @@ log_level = "info"
 
 [staking]
 # IMPORTANT: Replace with your actual private key (without 0x prefix)
-funded_address_private_key = "0xYOUR_PRIVATE_KEY_HERE"
+# If looking to register a validator, this wallet must have the required funds.
+# See https://docs.monad.xyz/developer-essentials/staking/staking-precompile#addvalidator
+funded_address_private_key = "0x<YOUR_PRIVATE_KEY_HERE>"
 
 [colors]
 border = "white"
@@ -113,16 +115,18 @@ Register a new validator on the network.
 
 **Requirements:**
 
-- Minimum stake to join register validator: 1,000,000 MON
+- Minimum stake to register validator: 100,000 MON
 - Valid SECP256k1 private key (64 hex chars, no 0x prefix)
 - Valid BLS private key (64 hex chars, with 0x prefix)
+
+The private keys should be recovered *only* using the `monad-keystore recover` functionality, see [here](#extract-private-keys).
 
 ```sh
 python main.py add-validator \
 --secp-privkey a1b2c3d4e5f6789... \
 --bls-privkey 0x1a2b3c4d5e6f789... \
 --auth-address 0x742d35C... \
---amount 1000000 \
+--amount 100000 \
 --config-path ~/config.toml
 ```
 
@@ -220,7 +224,7 @@ INFO     Tx hash: 0xabcdef1234567890...
 INFO     Commission successfully changed from 10.0% to 5.0% for validator 1
 ```
 
-**Note:** Only the Validator's authorized address can change the commission.
+**Note:** Only the Validator's registered `auth_address` can change the commission.
 
 ## Query Commands
 
@@ -372,7 +376,7 @@ If transactions fail with status `0`:
 1. Setup staking cli according to the [installation instructions](#installation).
 2. Create a `config.toml` file for the staking cli. Refer to `config.toml` [example](#configuration-setup).
 3. Get a Funded Address and populate the `config.toml` with it's private key.
-4. Make sure you have enough tokens in your wallet - **minimum stake: 1,000,000 MON** to register and **sufficient gas** to execute the transactions.
+4. Make sure you have enough tokens in your wallet - **minimum stake: 100,000 MON** to register and **sufficient gas** to execute the transactions.
 5. Choose between [cli](#cli-workflow) or [tui](#tui-workflow) mode and execute the `add-validator` workflow as described below.
 6. Follow the debug and troubleshooting steps below in case of unexpected behaviour or general issues.
 
@@ -405,7 +409,7 @@ python main.py add-validator \
 --config-path ~/config.toml
 ```
 
-> Authorized address is the address that will have control over validator operations on-chain. This address can be different from the funded address. Make sure you have control over the authorized address which you provide.
+> Authorized address is the address that will have control over validator operations on-chain. This address can be different from the funded address. Make sure you have control over the authorized address which you provide as it cannot be changed.
 
 - ⚠️ Make sure you verify keys before entering yes in the prompt
 
