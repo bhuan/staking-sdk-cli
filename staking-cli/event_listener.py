@@ -247,7 +247,7 @@ class StakingEventListener:
         lines = []
         lines.append(f"[bold]Block:[/bold] {event['blockNumber']}")
         lines.append(f"[bold]Time:[/bold] {event['timestamp']}")
-        lines.append(f"[bold]Tx Hash:[/bold] {event['transactionHash'][:16]}...")
+        lines.append(f"[bold]Tx Hash:[/bold] {event['transactionHash']}")
         lines.append("")
 
         if event_name == "ValidatorRewarded":
