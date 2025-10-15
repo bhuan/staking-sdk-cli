@@ -71,6 +71,9 @@ class StakingEventListener:
         self.events_history = []
         self.max_history = 100  # Keep last 100 events
 
+        # Track seen events to avoid duplicates in speculative mode
+        self.seen_events = set()  # Store (blockNumber, txHash, eventName, eventData) tuples
+
         # Initialize export files
         if self.export_csv:
             self._init_csv_file()
@@ -88,6 +91,52 @@ class StakingEventListener:
         except Exception as e:
             self.console.print(f"[red]Error initializing CSV file: {e}[/red]")
             self.export_csv = None
+
+    def _get_event_key(self, event: dict) -> tuple:
+        """Generate a unique key for deduplication."""
+        # Create a key from block, tx hash, event name, and key data fields
+        # This handles duplicates from speculative execution state transitions
+        key_data = []
+
+        # Add validator ID if present
+        if 'validatorId' in event:
+            key_data.append(('validatorId', event['validatorId']))
+
+        # Add addresses
+        for field in ['authAddress', 'delegator', 'from']:
+            if field in event and event[field]:
+                key_data.append((field, event[field].lower()))
+
+        # Add amount and epoch info
+        for field in ['amount', 'epoch', 'activationEpoch', 'withdrawEpoch', 'withdrawId']:
+            if field in event:
+                key_data.append((field, str(event[field])))
+
+        # Add commission info
+        for field in ['commission', 'oldCommission', 'newCommission']:
+            if field in event:
+                key_data.append((field, str(event[field])))
+
+        return (
+            event.get('blockNumber'),
+            event.get('transactionHash'),
+            event.get('name'),
+            tuple(sorted(key_data))
+        )
+
+    def _is_duplicate_event(self, event: dict) -> bool:
+        """Check if we've already seen this event (for speculative mode deduplication)."""
+        event_key = self._get_event_key(event)
+        if event_key in self.seen_events:
+            return True
+        self.seen_events.add(event_key)
+
+        # Limit seen_events cache size to prevent memory growth
+        if len(self.seen_events) > 10000:
+            # Clear oldest half of cache (simple approach)
+            self.seen_events = set(list(self.seen_events)[5000:])
+
+        return False
 
     def _should_display_event(self, event: dict) -> bool:
         """Check if event matches filter criteria."""
@@ -486,6 +535,11 @@ class StakingEventListener:
                     decoded_event = self.decode_event(log)
 
                     if decoded_event:
+                        # Check for duplicates (happens in speculative mode)
+                        if self._is_duplicate_event(decoded_event):
+                            # Silently skip duplicate - common in speculative execution
+                            continue
+
                         # Check if event matches filters
                         if self._should_display_event(decoded_event):
                             self.filtered_count += 1
