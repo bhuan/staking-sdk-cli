@@ -45,7 +45,8 @@ SIGNATURE_TO_EVENT = {v: k for k, v in EVENT_SIGNATURES.items()}
 
 class StakingEventListener:
     def __init__(self, ws_url: str, console: Console, speculative: bool = False,
-                 export_json: str = None, export_csv: str = None):
+                 export_json: str = None, export_csv: str = None,
+                 filter_validator_id: int = None, filter_address: str = None):
         """
         Initialize the event listener.
 
@@ -55,13 +56,18 @@ class StakingEventListener:
             speculative: Use monadLogs for speculative execution (~1s faster, pre-finalization)
             export_json: Path to JSON file for exporting events
             export_csv: Path to CSV file for exporting events
+            filter_validator_id: Only show events for this validator ID
+            filter_address: Only show events involving this address (delegator/validator)
         """
         self.ws_url = ws_url
         self.console = console
         self.speculative = speculative
         self.export_json = export_json
         self.export_csv = export_csv
+        self.filter_validator_id = filter_validator_id
+        self.filter_address = filter_address.lower() if filter_address else None
         self.event_count = 0
+        self.filtered_count = 0
         self.events_history = []
         self.max_history = 100  # Keep last 100 events
 
@@ -82,6 +88,32 @@ class StakingEventListener:
         except Exception as e:
             self.console.print(f"[red]Error initializing CSV file: {e}[/red]")
             self.export_csv = None
+
+    def _should_display_event(self, event: dict) -> bool:
+        """Check if event matches filter criteria."""
+        # If no filters, display all events
+        if not self.filter_validator_id and not self.filter_address:
+            return True
+
+        # Filter by validator ID
+        if self.filter_validator_id:
+            event_validator_id = event.get('validatorId')
+            if event_validator_id is None or event_validator_id != self.filter_validator_id:
+                return False
+
+        # Filter by address
+        if self.filter_address:
+            # Check all address fields
+            event_addresses = [
+                event.get('authAddress', '').lower(),
+                event.get('delegator', '').lower(),
+                event.get('from', '').lower(),
+            ]
+
+            if self.filter_address not in event_addresses:
+                return False
+
+        return True
 
     def _export_event(self, event: dict):
         """Export event to configured export formats."""
@@ -409,6 +441,15 @@ class StakingEventListener:
         mode_desc = "[yellow bold]SPECULATIVE MODE[/yellow bold] (~1s faster, pre-finalization)" if self.speculative else "[green]FINALIZED MODE[/green] (confirmed blocks)"
         self.console.print(f"Mode: {mode_desc}")
         self.console.print(f"[dim]Subscription type: {subscription_type}[/dim]")
+
+        # Display active filters
+        if self.filter_validator_id or self.filter_address:
+            self.console.print("\n[bold yellow]Active Filters:[/bold yellow]")
+            if self.filter_validator_id:
+                self.console.print(f"  [dim]• Validator ID: {self.filter_validator_id}[/dim]")
+            if self.filter_address:
+                self.console.print(f"  [dim]• Address: {self.filter_address}[/dim]")
+
         self.console.print("[yellow]Press Ctrl+C to stop[/yellow]\n")
 
         # Create subscription filter - only logs from staking contract
@@ -445,18 +486,28 @@ class StakingEventListener:
                     decoded_event = self.decode_event(log)
 
                     if decoded_event:
-                        # Store in history
-                        self.events_history.append(decoded_event)
-                        if len(self.events_history) > self.max_history:
-                            self.events_history.pop(0)
+                        # Check if event matches filters
+                        if self._should_display_event(decoded_event):
+                            self.filtered_count += 1
 
-                        # Export event to files if configured
-                        self._export_event(decoded_event)
+                            # Store in history
+                            self.events_history.append(decoded_event)
+                            if len(self.events_history) > self.max_history:
+                                self.events_history.pop(0)
 
-                        # Display the event
-                        panel = self.format_event(decoded_event)
-                        self.console.print(panel)
-                        self.console.print(f"[dim]Total events received: {self.event_count}[/dim]\n")
+                            # Export event to files if configured
+                            self._export_event(decoded_event)
+
+                            # Display the event
+                            panel = self.format_event(decoded_event)
+                            self.console.print(panel)
+
+                            # Show count (filtered/total if filtering is active)
+                            if self.filter_validator_id or self.filter_address:
+                                self.console.print(f"[dim]Events displayed: {self.filtered_count} | Total received: {self.event_count}[/dim]\n")
+                            else:
+                                self.console.print(f"[dim]Total events received: {self.event_count}[/dim]\n")
+                        # If event doesn't match filter, silently skip (don't spam console)
                     else:
                         self.console.print(f"[dim]Received unknown event or failed to decode[/dim]")
 
@@ -507,6 +558,16 @@ async def main():
         type=str,
         help="Export events to CSV file (e.g., events.csv)"
     )
+    parser.add_argument(
+        "--filter-validator-id",
+        type=int,
+        help="Only display events for specific validator ID"
+    )
+    parser.add_argument(
+        "--filter-address",
+        type=str,
+        help="Only display events involving specific address (validator/delegator)"
+    )
 
     args = parser.parse_args()
 
@@ -554,7 +615,9 @@ async def main():
         console,
         speculative=args.speculative,
         export_json=args.export_json,
-        export_csv=args.export_csv
+        export_csv=args.export_csv,
+        filter_validator_id=args.filter_validator_id,
+        filter_address=args.filter_address
     )
     await listener.listen_for_events()
 
