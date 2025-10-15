@@ -10,6 +10,8 @@ import os
 import argparse
 import asyncio
 import toml
+import json
+import csv
 from web3 import Web3, AsyncWeb3
 from web3.providers.persistent import WebSocketProvider
 from eth_abi import decode
@@ -19,6 +21,7 @@ from rich.table import Table
 from rich.live import Live
 from rich.text import Text
 from datetime import datetime
+from pathlib import Path
 
 # Staking precompile address
 STAKING_CONTRACT_ADDRESS = "0x0000000000000000000000000000000000001000"
@@ -41,7 +44,8 @@ SIGNATURE_TO_EVENT = {v: k for k, v in EVENT_SIGNATURES.items()}
 
 
 class StakingEventListener:
-    def __init__(self, ws_url: str, console: Console, speculative: bool = False):
+    def __init__(self, ws_url: str, console: Console, speculative: bool = False,
+                 export_json: str = None, export_csv: str = None):
         """
         Initialize the event listener.
 
@@ -49,13 +53,93 @@ class StakingEventListener:
             ws_url: WebSocket URL of the Monad node
             console: Rich console for output
             speculative: Use monadLogs for speculative execution (~1s faster, pre-finalization)
+            export_json: Path to JSON file for exporting events
+            export_csv: Path to CSV file for exporting events
         """
         self.ws_url = ws_url
         self.console = console
         self.speculative = speculative
+        self.export_json = export_json
+        self.export_csv = export_csv
         self.event_count = 0
         self.events_history = []
         self.max_history = 100  # Keep last 100 events
+
+        # Initialize export files
+        if self.export_csv:
+            self._init_csv_file()
+
+    def _init_csv_file(self):
+        """Initialize CSV file with headers."""
+        try:
+            with open(self.export_csv, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'Timestamp', 'Event Name', 'Block Number', 'Transaction Hash',
+                    'Validator ID', 'Address', 'Amount', 'Epoch', 'Additional Data'
+                ])
+            self.console.print(f"[green]✓ CSV export initialized: {self.export_csv}[/green]")
+        except Exception as e:
+            self.console.print(f"[red]Error initializing CSV file: {e}[/red]")
+            self.export_csv = None
+
+    def _export_event(self, event: dict):
+        """Export event to configured export formats."""
+        # Export to JSON (append mode)
+        if self.export_json:
+            try:
+                # Read existing data
+                if Path(self.export_json).exists():
+                    with open(self.export_json, 'r') as f:
+                        try:
+                            data = json.load(f)
+                        except json.JSONDecodeError:
+                            data = []
+                else:
+                    data = []
+
+                # Append new event
+                data.append(event)
+
+                # Write back
+                with open(self.export_json, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+            except Exception as e:
+                self.console.print(f"[red]Error exporting to JSON: {e}[/red]")
+
+        # Export to CSV (append mode)
+        if self.export_csv:
+            try:
+                with open(self.export_csv, 'a', newline='') as f:
+                    writer = csv.writer(f)
+
+                    # Extract common fields
+                    validator_id = event.get('validatorId', '')
+                    address = event.get('authAddress') or event.get('delegator') or event.get('from', '')
+                    amount = event.get('amount', '')
+                    epoch = event.get('epoch') or event.get('activationEpoch') or event.get('withdrawEpoch', '')
+
+                    # Collect additional data
+                    additional = {}
+                    for key, value in event.items():
+                        if key not in ['name', 'blockNumber', 'transactionHash', 'timestamp',
+                                      'validatorId', 'authAddress', 'delegator', 'from',
+                                      'amount', 'epoch', 'activationEpoch', 'withdrawEpoch']:
+                            additional[key] = value
+
+                    writer.writerow([
+                        event.get('timestamp', ''),
+                        event.get('name', ''),
+                        event.get('blockNumber', ''),
+                        event.get('transactionHash', ''),
+                        validator_id,
+                        address,
+                        amount,
+                        epoch,
+                        json.dumps(additional) if additional else ''
+                    ])
+            except Exception as e:
+                self.console.print(f"[red]Error exporting to CSV: {e}[/red]")
 
     def decode_indexed_param(self, param_type: str, topic) -> any:
         """Decode an indexed parameter from a topic."""
@@ -366,6 +450,9 @@ class StakingEventListener:
                         if len(self.events_history) > self.max_history:
                             self.events_history.pop(0)
 
+                        # Export event to files if configured
+                        self._export_event(decoded_event)
+
                         # Display the event
                         panel = self.format_event(decoded_event)
                         self.console.print(panel)
@@ -410,6 +497,16 @@ async def main():
         action="store_true",
         help="Use monadLogs for speculative execution (~1s faster, pre-finalization)"
     )
+    parser.add_argument(
+        "--export-json",
+        type=str,
+        help="Export events to JSON file (e.g., events.json)"
+    )
+    parser.add_argument(
+        "--export-csv",
+        type=str,
+        help="Export events to CSV file (e.g., events.csv)"
+    )
 
     args = parser.parse_args()
 
@@ -452,7 +549,13 @@ async def main():
             sys.exit(1)
 
     # Create listener and start
-    listener = StakingEventListener(ws_url, console, speculative=args.speculative)
+    listener = StakingEventListener(
+        ws_url,
+        console,
+        speculative=args.speculative,
+        export_json=args.export_json,
+        export_csv=args.export_csv
+    )
     await listener.listen_for_events()
 
 
