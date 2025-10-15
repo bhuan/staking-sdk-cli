@@ -41,16 +41,18 @@ SIGNATURE_TO_EVENT = {v: k for k, v in EVENT_SIGNATURES.items()}
 
 
 class StakingEventListener:
-    def __init__(self, ws_url: str, console: Console):
+    def __init__(self, ws_url: str, console: Console, speculative: bool = False):
         """
         Initialize the event listener.
 
         Args:
             ws_url: WebSocket URL of the Monad node
             console: Rich console for output
+            speculative: Use monadLogs for speculative execution (~1s faster, pre-finalization)
         """
         self.ws_url = ws_url
         self.console = console
+        self.speculative = speculative
         self.event_count = 0
         self.events_history = []
         self.max_history = 100  # Keep last 100 events
@@ -317,6 +319,12 @@ class StakingEventListener:
         """
         self.console.print(f"[cyan]Connecting to {self.ws_url}...[/cyan]")
         self.console.print(f"\n[bold cyan]Starting event listener for staking contract: {STAKING_CONTRACT_ADDRESS}[/bold cyan]")
+
+        # Determine subscription type
+        subscription_type = 'monadLogs' if self.speculative else 'logs'
+        mode_desc = "[yellow bold]SPECULATIVE MODE[/yellow bold] (~1s faster, pre-finalization)" if self.speculative else "[green]FINALIZED MODE[/green] (confirmed blocks)"
+        self.console.print(f"Mode: {mode_desc}")
+        self.console.print(f"[dim]Subscription type: {subscription_type}[/dim]")
         self.console.print("[yellow]Press Ctrl+C to stop[/yellow]\n")
 
         # Create subscription filter - only logs from staking contract
@@ -336,8 +344,8 @@ class StakingEventListener:
                 except Exception as e:
                     self.console.print(f"[yellow]Note: Could not fetch block number: {e}[/yellow]\n")
 
-                # Subscribe to logs
-                subscription_id = await w3.eth.subscribe('logs', filter_params)
+                # Subscribe to logs (use monadLogs for speculative, logs for finalized)
+                subscription_id = await w3.eth.subscribe(subscription_type, filter_params)
                 self.console.print(f"[green]✓ Subscribed to staking events (subscription ID: {subscription_id})[/green]\n")
 
                 # Process subscription events
@@ -397,6 +405,11 @@ async def main():
         default="./config.toml",
         help="Path to config.toml file (default: ./config.toml)"
     )
+    parser.add_argument(
+        "--speculative",
+        action="store_true",
+        help="Use monadLogs for speculative execution (~1s faster, pre-finalization)"
+    )
 
     args = parser.parse_args()
 
@@ -439,7 +452,7 @@ async def main():
             sys.exit(1)
 
     # Create listener and start
-    listener = StakingEventListener(ws_url, console)
+    listener = StakingEventListener(ws_url, console, speculative=args.speculative)
     await listener.listen_for_events()
 
 
