@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monad-events-web-ui
+  namespace: monad-staking
+  labels:
+    app: monad-events-web-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: monad-events-web-ui
+  template:
+    metadata:
+      labels:
+        app: monad-events-web-ui
+    spec:
+      imagePullSecrets:
+      - name: peach10-regcred
+      containers:
+      - name: web-ui
+        image: peach10.devcore4.com/category-labs/monad-events-web-ui:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 5000
+          name: http
+        env:
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: event-listener-config
+              key: db_host
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: event-listener-config
+              key: db_port
+        - name: DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: event-listener-config
+              key: db_name
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: event-listener-secrets
+              key: db_user
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: event-listener-secrets
+              key: db_password
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: monad-events-web-ui-service
+  namespace: monad-staking
+  labels:
+    app: monad-events-web-ui
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 5000
+    protocol: TCP
+    name: http
+  selector:
+    app: monad-events-web-ui
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: monad-events-web-ui-ingress
+  namespace: monad-staking
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - monad-events.peach10.devcore4.com
+    secretName: monad-events-web-ui-tls
+  rules:
+  - host: monad-events.peach10.devcore4.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: monad-events-web-ui-service
+            port:
+              number: 80

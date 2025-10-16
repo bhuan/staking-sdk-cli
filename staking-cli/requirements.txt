@@ -1,0 +1,13 @@
+# Core dependencies
+web3>=6.0.0
+eth-abi>=5.2.0
+toml>=0.10.2
+
+# Rich terminal output
+rich>=14.1.0
+
+# Async PostgreSQL driver
+asyncpg>=0.29.0
+
+# Optional: For better decimal handling
+# decimal is built-in to Python standard library

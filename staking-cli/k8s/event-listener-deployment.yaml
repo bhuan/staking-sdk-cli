@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: monad-events-listener
+  namespace: monad-staking
+  labels:
+    app: monad-events-listener
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: monad-events-listener
+  template:
+    metadata:
+      labels:
+        app: monad-events-listener
+    spec:
+      imagePullSecrets:
+      - name: peach10-regcred
+      containers:
+      - name: event-listener
+        image: peach10.devcore4.com/category-labs/monad-event-listener:latest
+        imagePullPolicy: Always
+        command:
+        - python
+        - event_listener.py
+        args:
+        - --ws-url=$(WS_URL)
+        - --speculative
+        - --db-host=$(DB_HOST)
+        - --db-port=$(DB_PORT)
+        - --db-name=$(DB_NAME)
+        - --db-user=$(DB_USER)
+        - --db-password=$(DB_PASSWORD)
+        env:
+        - name: WS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: event-listener-config
+              key: rpc_url
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: event-listener-config
+              key: db_host
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: event-listener-config
+              key: db_port
+        - name: DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: event-listener-config
+              key: db_name
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: event-listener-secrets
+              key: db_user
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: event-listener-secrets
+              key: db_password
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+      restartPolicy: Always
