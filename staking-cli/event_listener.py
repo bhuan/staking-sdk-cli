@@ -12,6 +12,8 @@ import asyncio
 import toml
 import json
 import csv
+import logging
+from collections import deque
 from web3 import Web3, AsyncWeb3
 from web3.providers.persistent import WebSocketProvider
 from eth_abi import decode
@@ -20,8 +22,17 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.live import Live
 from rich.text import Text
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+import asyncpg
+from decimal import Decimal
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # Staking precompile address
 STAKING_CONTRACT_ADDRESS = "0x0000000000000000000000000000000000001000"
@@ -46,7 +57,8 @@ SIGNATURE_TO_EVENT = {v: k for k, v in EVENT_SIGNATURES.items()}
 class StakingEventListener:
     def __init__(self, ws_url: str, console: Console, speculative: bool = False,
                  export_json: str = None, export_csv: str = None,
-                 filter_validator_id: int = None, filter_address: str = None):
+                 filter_validator_id: int = None, filter_address: str = None,
+                 db_config: dict = None):
         """
         Initialize the event listener.
 
@@ -58,6 +70,7 @@ class StakingEventListener:
             export_csv: Path to CSV file for exporting events
             filter_validator_id: Only show events for this validator ID
             filter_address: Only show events involving this address (delegator/validator)
+            db_config: Database configuration dict (host, port, database, user, password)
         """
         self.ws_url = ws_url
         self.console = console
@@ -66,13 +79,20 @@ class StakingEventListener:
         self.export_csv = export_csv
         self.filter_validator_id = filter_validator_id
         self.filter_address = filter_address.lower() if filter_address else None
+        self.db_config = db_config
+        self.db_pool: Optional[asyncpg.Pool] = None
         self.event_count = 0
         self.filtered_count = 0
         self.events_history = []
         self.max_history = 100  # Keep last 100 events
 
         # Track seen events to avoid duplicates in speculative mode
-        self.seen_events = set()  # Store (blockNumber, txHash, eventName, eventData) tuples
+        # Using deque to maintain insertion order for proper cache eviction
+        self.seen_events = deque(maxlen=10000)  # Auto-evicts oldest when full
+        self.seen_events_set = set()  # Fast lookup
+
+        # Track last processed block for catch-up on reconnection
+        self.last_block_number = None
 
         # Initialize export files
         if self.export_csv:
@@ -127,14 +147,18 @@ class StakingEventListener:
     def _is_duplicate_event(self, event: dict) -> bool:
         """Check if we've already seen this event (for speculative mode deduplication)."""
         event_key = self._get_event_key(event)
-        if event_key in self.seen_events:
+        if event_key in self.seen_events_set:
             return True
-        self.seen_events.add(event_key)
 
-        # Limit seen_events cache size to prevent memory growth
-        if len(self.seen_events) > 10000:
-            # Clear oldest half of cache (simple approach)
-            self.seen_events = set(list(self.seen_events)[5000:])
+        # Add to both deque and set
+        self.seen_events.append(event_key)
+        self.seen_events_set.add(event_key)
+
+        # When deque is full, it auto-evicts the oldest item
+        # We need to sync the set by removing evicted items
+        if len(self.seen_events_set) > len(self.seen_events):
+            # Rebuild set from deque to remove stale entries
+            self.seen_events_set = set(self.seen_events)
 
         return False
 
@@ -164,8 +188,102 @@ class StakingEventListener:
 
         return True
 
-    def _export_event(self, event: dict):
+    async def _init_db_pool(self):
+        """Initialize database connection pool and get last processed block."""
+        if not self.db_config:
+            return
+
+        try:
+            self.db_pool = await asyncpg.create_pool(
+                host=self.db_config.get('host', 'localhost'),
+                port=self.db_config.get('port', 5432),
+                database=self.db_config.get('database', 'monad_events'),
+                user=self.db_config.get('user', 'postgres'),
+                password=self.db_config.get('password', ''),
+                min_size=2,
+                max_size=10,
+                command_timeout=60
+            )
+            self.console.print(f"[green]✓ Database connection pool initialized[/green]")
+
+            # Get last processed block from database for catch-up on restart
+            async with self.db_pool.acquire() as conn:
+                result = await conn.fetchval('SELECT MAX(block_number) FROM staking_events')
+                if result:
+                    self.last_block_number = result
+                    self.console.print(f"[cyan]Last block in database: {result}[/cyan]")
+                else:
+                    self.console.print(f"[dim]Database is empty, starting fresh[/dim]")
+
+        except Exception as e:
+            self.console.print(f"[red]Error connecting to database: {e}[/red]")
+            self.console.print(f"[yellow]Continuing without database storage...[/yellow]")
+            self.db_pool = None
+
+    async def _close_db_pool(self):
+        """Close database connection pool."""
+        if self.db_pool:
+            await self.db_pool.close()
+            self.console.print(f"[cyan]Database connection pool closed[/cyan]")
+
+    async def _save_event_to_db(self, event: dict):
+        """Save event to PostgreSQL database."""
+        if not self.db_pool:
+            return
+
+        try:
+            # Extract common fields
+            validator_id = event.get('validatorId')
+            address = event.get('authAddress') or event.get('delegator') or event.get('from')
+            amount = event.get('amount')
+            epoch = event.get('epoch') or event.get('activationEpoch') or event.get('withdrawEpoch')
+
+            # Convert amount to wei (stored as Decimal in DB)
+            amount_wei = None
+            if amount is not None:
+                # Amount is in MON (ether), convert to wei
+                amount_wei = Decimal(str(amount)) * Decimal('1000000000000000000')
+
+            # Collect additional event-specific data
+            event_data = {}
+            for key, value in event.items():
+                if key not in ['name', 'blockNumber', 'transactionHash', 'timestamp',
+                              'validatorId', 'authAddress', 'delegator', 'from',
+                              'amount', 'epoch', 'activationEpoch', 'withdrawEpoch']:
+                    # Convert Decimal to string for JSON storage
+                    if isinstance(value, (Decimal, float)):
+                        event_data[key] = str(value)
+                    else:
+                        event_data[key] = value
+
+            # Insert into database
+            async with self.db_pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO staking_events (
+                        timestamp, event_name, block_number, transaction_hash,
+                        validator_id, address, amount, epoch, event_data
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT DO NOTHING
+                ''',
+                    datetime.now(timezone.utc),
+                    event['name'],
+                    event['blockNumber'],
+                    event['transactionHash'],
+                    validator_id,
+                    address.lower() if address else None,
+                    amount_wei,
+                    epoch,
+                    json.dumps(event_data) if event_data else None
+                )
+        except Exception as e:
+            self.console.print(f"[red]Error saving to database: {e}[/red]")
+
+    async def _export_event(self, event: dict):
         """Export event to configured export formats."""
+        # Save to database
+        if self.db_pool:
+            await self._save_event_to_db(event)
+
         # Export to JSON (append mode)
         if self.export_json:
             try:
@@ -259,7 +377,7 @@ class StakingEventListener:
         """
         # Check if topics exist and have content
         if 'topics' not in log or not log['topics'] or len(log['topics']) == 0:
-            self.console.print(f"[yellow]Debug: Log has no topics. Log keys: {log.keys()}[/yellow]")
+            logging.warning(f"Log has no topics. Log keys: {log.keys()}")
             return None
 
         # Get event signature from first topic
@@ -277,8 +395,7 @@ class StakingEventListener:
         event_name = SIGNATURE_TO_EVENT.get(event_sig)
 
         if not event_name:
-            self.console.print(f"[yellow]Debug: Unknown event signature: {event_sig}[/yellow]")
-            self.console.print(f"[yellow]Debug: Known signatures: {list(SIGNATURE_TO_EVENT.keys())[:3]}...[/yellow]")
+            logging.debug(f"Unknown event signature: {event_sig}")
             return None
 
         # Handle transactionHash - can be hex string or HexBytes
@@ -292,7 +409,7 @@ class StakingEventListener:
             'name': event_name,
             'blockNumber': log.get('blockNumber', 0),
             'transactionHash': tx_hash_hex,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
         }
 
         # Get data field - handle both hex string and HexBytes
@@ -477,11 +594,206 @@ class StakingEventListener:
             padding=(1, 2)
         )
 
+    async def _catchup_missed_events(self, w3, filter_params: dict):
+        """
+        Fetch missed events since last processed block.
+        Uses chunked requests (10 blocks at a time) to respect Monad's eth_getLogs limitations.
+        """
+        if not self.last_block_number:
+            return  # First connection, no catch-up needed
+
+        try:
+            current_block = await w3.eth.block_number
+
+            if current_block > self.last_block_number:
+                missed_blocks = current_block - self.last_block_number
+                self.console.print(f"[yellow]⚠ Catching up {missed_blocks} missed blocks ({self.last_block_number} → {current_block})[/yellow]")
+
+                # Chunk size: 10 blocks per request (Monad recommendation for optimal performance)
+                chunk_size = 10
+                total_events_found = 0
+
+                # Process in chunks
+                from_block = self.last_block_number + 1
+                while from_block <= current_block:
+                    to_block = min(from_block + chunk_size - 1, current_block)
+
+                    try:
+                        # Fetch historical logs for this chunk
+                        historical_filter = {
+                            'address': filter_params['address'],
+                            'fromBlock': from_block,
+                            'toBlock': to_block
+                        }
+
+                        logs = await w3.eth.get_logs(historical_filter)
+
+                        if logs:
+                            total_events_found += len(logs)
+                            self.console.print(f"[dim]Chunk {from_block}-{to_block}: {len(logs)} events[/dim]")
+
+                            for log in logs:
+                                self.event_count += 1  # Count all events received
+
+                                # Process each missed event
+                                decoded_event = self.decode_event(log)
+
+                                if decoded_event:
+                                    # Update last block number
+                                    if decoded_event.get('blockNumber', 0) > (self.last_block_number or 0):
+                                        self.last_block_number = decoded_event['blockNumber']
+
+                                    # Check for duplicates
+                                    if self._is_duplicate_event(decoded_event):
+                                        continue
+
+                                    # Check filters
+                                    if self._should_display_event(decoded_event):
+                                        self.filtered_count += 1
+
+                                        # Export to DB/files
+                                        await self._export_event(decoded_event)
+
+                                        # Display (but more compact during catch-up)
+                                        panel = self.format_event(decoded_event)
+                                        self.console.print(panel)
+
+                                        if self.filter_validator_id or self.filter_address:
+                                            self.console.print(f"[dim]Events displayed: {self.filtered_count} | Total received: {self.event_count}[/dim]\n")
+                                        else:
+                                            self.console.print(f"[dim]Total events received: {self.event_count}[/dim]\n")
+
+                    except Exception as chunk_error:
+                        self.console.print(f"[yellow]Error fetching chunk {from_block}-{to_block}: {chunk_error}[/yellow]")
+                        # Continue with next chunk even if one fails
+
+                    # Move to next chunk
+                    from_block = to_block + 1
+
+                if total_events_found > 0:
+                    self.console.print(f"[green]✓ Catch-up complete: processed {total_events_found} events from {missed_blocks} blocks[/green]\n")
+                else:
+                    self.console.print(f"[dim]No events during downtime ({missed_blocks} blocks checked)[/dim]\n")
+
+        except Exception as e:
+            self.console.print(f"[yellow]Warning: Could not catch up missed events: {e}[/yellow]")
+            self.console.print(f"[yellow]Continuing with real-time monitoring from current block[/yellow]\n")
+
+    async def _connect_and_listen(self, filter_params: dict, subscription_type: str):
+        """
+        Internal method to establish connection and process events.
+        """
+        last_event_time = asyncio.get_event_loop().time()
+        timeout_seconds = 300  # 5 minutes without events = reconnect
+
+        async with AsyncWeb3(WebSocketProvider(self.ws_url)) as w3:
+            self.console.print("[green]✓ Connected to Monad node[/green]")
+
+            # Subscribe IMMEDIATELY to start receiving real-time events
+            subscription_id = await w3.eth.subscribe(subscription_type, filter_params)
+            self.console.print(f"[green]✓ Subscribed to staking events (subscription ID: {subscription_id})[/green]")
+
+            # Get current block number and catch up in background
+            try:
+                current_block = await w3.eth.block_number
+                self.console.print(f"[cyan]Current block: {current_block}[/cyan]")
+
+                # Start catch-up in background (non-blocking) with error handling
+                # The deduplication system will handle any overlap between catch-up and real-time
+                if self.last_block_number:
+                    async def catchup_with_error_handling():
+                        try:
+                            await self._catchup_missed_events(w3, filter_params)
+                        except Exception as e:
+                            self.console.print(f"[red]Error during catch-up: {e}[/red]")
+                            logging.exception("Catch-up failed with exception:")
+
+                    asyncio.create_task(catchup_with_error_handling())
+                else:
+                    self.console.print(f"[dim]First connection, starting from current block[/dim]\n")
+
+            except Exception as e:
+                self.console.print(f"[yellow]Note: Could not fetch block number: {e}[/yellow]\n")
+
+            # Process subscription events with timeout detection
+            async def process_events():
+                nonlocal last_event_time
+                async for payload in w3.socket.process_subscriptions():
+                    last_event_time = asyncio.get_event_loop().time()
+
+                    # Extract the log from the payload
+                    if 'result' not in payload:
+                        continue
+
+                    log = payload['result']
+                    self.event_count += 1
+
+                    # Decode the event
+                    decoded_event = self.decode_event(log)
+
+                    if decoded_event:
+                        # Update last processed block number
+                        block_num = decoded_event.get('blockNumber', 0)
+                        if block_num > (self.last_block_number or 0):
+                            self.last_block_number = block_num
+
+                        # Check for duplicates (happens in speculative mode)
+                        if self._is_duplicate_event(decoded_event):
+                            # Silently skip duplicate - common in speculative execution
+                            continue
+
+                        # Check if event matches filters
+                        if self._should_display_event(decoded_event):
+                            self.filtered_count += 1
+
+                            # Store in history
+                            self.events_history.append(decoded_event)
+                            if len(self.events_history) > self.max_history:
+                                self.events_history.pop(0)
+
+                            # Export event to files/database if configured
+                            await self._export_event(decoded_event)
+
+                            # Display the event
+                            panel = self.format_event(decoded_event)
+                            self.console.print(panel)
+
+                            # Show count (filtered/total if filtering is active)
+                            if self.filter_validator_id or self.filter_address:
+                                self.console.print(f"[dim]Events displayed: {self.filtered_count} | Total received: {self.event_count}[/dim]\n")
+                            else:
+                                self.console.print(f"[dim]Total events received: {self.event_count}[/dim]\n")
+                        # If event doesn't match filter, silently skip (don't spam console)
+                    else:
+                        self.console.print(f"[dim]Received unknown event or failed to decode[/dim]")
+
+            # Watchdog to detect stuck connections
+            async def watchdog():
+                nonlocal last_event_time
+                while True:
+                    await asyncio.sleep(60)  # Check every minute
+                    elapsed = asyncio.get_event_loop().time() - last_event_time
+                    if elapsed > timeout_seconds:
+                        raise TimeoutError(f"No events received for {int(elapsed)} seconds - connection appears dead")
+
+            # Run both tasks concurrently
+            try:
+                await asyncio.gather(
+                    process_events(),
+                    watchdog()
+                )
+            except TimeoutError as e:
+                self.console.print(f"[yellow]Watchdog timeout: {e}[/yellow]")
+                raise
+
     async def listen_for_events(self):
         """
-        Main event listening loop.
+        Main event listening loop with automatic reconnection.
         Subscribes to logs and processes them in real-time using AsyncWeb3.
         """
+        # Initialize database connection pool if configured
+        await self._init_db_pool()
+
         self.console.print(f"[cyan]Connecting to {self.ws_url}...[/cyan]")
         self.console.print(f"\n[bold cyan]Starting event listener for staking contract: {STAKING_CONTRACT_ADDRESS}[/bold cyan]")
 
@@ -506,71 +818,42 @@ class StakingEventListener:
             'address': STAKING_CONTRACT_ADDRESS,
         }
 
+        # Reconnection settings
+        max_retries = None  # Infinite retries
+        retry_delay = 1  # Start with 1 second
+        max_retry_delay = 60  # Max 60 seconds between retries
+        retry_count = 0
+
         try:
-            # Use AsyncWeb3 with persistent WebSocket provider
-            async with AsyncWeb3(WebSocketProvider(self.ws_url)) as w3:
-                self.console.print("[green]✓ Connected to Monad node[/green]")
-
-                # Get current block number
+            while True:
                 try:
-                    current_block = await w3.eth.block_number
-                    self.console.print(f"[cyan]Current block: {current_block}[/cyan]\n")
+                    await self._connect_and_listen(filter_params, subscription_type)
+                    # If we get here, connection closed normally
+                    break
+                except KeyboardInterrupt:
+                    raise  # Propagate KeyboardInterrupt to outer handler
                 except Exception as e:
-                    self.console.print(f"[yellow]Note: Could not fetch block number: {e}[/yellow]\n")
+                    retry_count += 1
+                    # Calculate backoff delay with exponential backoff
+                    delay = min(retry_delay * (2 ** (retry_count - 1)), max_retry_delay)
 
-                # Subscribe to logs (use monadLogs for speculative, logs for finalized)
-                subscription_id = await w3.eth.subscribe(subscription_type, filter_params)
-                self.console.print(f"[green]✓ Subscribed to staking events (subscription ID: {subscription_id})[/green]\n")
+                    self.console.print(f"[yellow]Connection lost: {e}[/yellow]")
+                    self.console.print(f"[cyan]Reconnecting in {delay} seconds... (attempt {retry_count})[/cyan]")
 
-                # Process subscription events
-                async for payload in w3.socket.process_subscriptions():
-                    # Extract the log from the payload
-                    if 'result' not in payload:
-                        continue
+                    await asyncio.sleep(delay)
 
-                    log = payload['result']
-                    self.event_count += 1
-
-                    # Decode the event
-                    decoded_event = self.decode_event(log)
-
-                    if decoded_event:
-                        # Check for duplicates (happens in speculative mode)
-                        if self._is_duplicate_event(decoded_event):
-                            # Silently skip duplicate - common in speculative execution
-                            continue
-
-                        # Check if event matches filters
-                        if self._should_display_event(decoded_event):
-                            self.filtered_count += 1
-
-                            # Store in history
-                            self.events_history.append(decoded_event)
-                            if len(self.events_history) > self.max_history:
-                                self.events_history.pop(0)
-
-                            # Export event to files if configured
-                            self._export_event(decoded_event)
-
-                            # Display the event
-                            panel = self.format_event(decoded_event)
-                            self.console.print(panel)
-
-                            # Show count (filtered/total if filtering is active)
-                            if self.filter_validator_id or self.filter_address:
-                                self.console.print(f"[dim]Events displayed: {self.filtered_count} | Total received: {self.event_count}[/dim]\n")
-                            else:
-                                self.console.print(f"[dim]Total events received: {self.event_count}[/dim]\n")
-                        # If event doesn't match filter, silently skip (don't spam console)
-                    else:
-                        self.console.print(f"[dim]Received unknown event or failed to decode[/dim]")
+                    # Reset retry count on successful reconnection after some events
+                    if retry_count > 5:
+                        retry_count = max(0, retry_count - 1)
 
         except KeyboardInterrupt:
             self.console.print("\n[yellow]Stopping event listener...[/yellow]")
         except Exception as e:
-            self.console.print(f"[red]Error in event listener: {e}[/red]")
-            import traceback
-            traceback.print_exc()
+            self.console.print(f"[red]Fatal error in event listener: {e}[/red]")
+            logging.exception("Event listener crashed with exception:")
+        finally:
+            # Close database connection pool
+            await self._close_db_pool()
 
 
 def read_config(config_path: str) -> dict:
@@ -622,6 +905,33 @@ async def main():
         type=str,
         help="Only display events involving specific address (validator/delegator)"
     )
+    parser.add_argument(
+        "--db-host",
+        type=str,
+        help="Database host (default: from config or localhost)"
+    )
+    parser.add_argument(
+        "--db-port",
+        type=int,
+        default=5432,
+        help="Database port (default: 5432)"
+    )
+    parser.add_argument(
+        "--db-name",
+        type=str,
+        default="monad_events",
+        help="Database name (default: monad_events)"
+    )
+    parser.add_argument(
+        "--db-user",
+        type=str,
+        help="Database user (default: from config or postgres)"
+    )
+    parser.add_argument(
+        "--db-password",
+        type=str,
+        help="Database password (default: from config or empty)"
+    )
 
     args = parser.parse_args()
 
@@ -663,6 +973,28 @@ async def main():
             console.print("Please provide a WebSocket URL using --ws-url")
             sys.exit(1)
 
+    # Build database configuration
+    # Try from command line args, then from config file
+    config = {}
+    try:
+        config = read_config(args.config_path)
+    except FileNotFoundError:
+        pass
+
+    db_host = args.db_host or config.get('database', {}).get('host')
+    db_user = args.db_user or config.get('database', {}).get('user')
+
+    # Only create db_config if we have at least a host
+    db_config = None
+    if db_host:
+        db_config = {
+            'host': db_host,
+            'port': args.db_port,
+            'database': args.db_name,
+            'user': db_user or 'postgres',
+            'password': args.db_password or config.get('database', {}).get('password', ''),
+        }
+
     # Create listener and start
     listener = StakingEventListener(
         ws_url,
@@ -671,7 +1003,8 @@ async def main():
         export_json=args.export_json,
         export_csv=args.export_csv,
         filter_validator_id=args.filter_validator_id,
-        filter_address=args.filter_address
+        filter_address=args.filter_address,
+        db_config=db_config
     )
     await listener.listen_for_events()
 

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monad Staking Events</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body class="bg-gray-50">
+    <div id="app">
+        <!-- Header -->
+        <header class="bg-gradient-to-r from-purple-600 to-blue-600 text-white shadow-lg">
+            <div class="container mx-auto px-4 py-6">
+                <h1 class="text-3xl font-bold">Monad Staking Events</h1>
+            </div>
+        </header>
+
+        <div class="container mx-auto px-4 py-8">
+            <!-- Stats Cards -->
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="text-gray-500 text-sm font-medium">Total Events</div>
+                    <div class="text-3xl font-bold text-gray-900 mt-2" v-text="(stats.total_events || 0).toLocaleString()"></div>
+                </div>
+                <div class="bg-white rounded-lg shadow p-6">
+                    <div class="text-gray-500 text-sm font-medium">Last 24h</div>
+                    <div class="text-3xl font-bold text-green-600 mt-2" v-text="(stats.recent_24h || 0).toLocaleString()"></div>
+                </div>
+            </div>
+
+            <!-- Filters -->
+            <div class="bg-white rounded-lg shadow p-6 mb-8">
+                <h2 class="text-xl font-bold text-gray-900 mb-4">Filters</h2>
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Time Range</label>
+                        <select v-model="filters.hours" @change="loadEvents" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            <option value="1">Last 1 hour</option>
+                            <option value="24">Last 24 hours</option>
+                            <option value="168">Last 7 days</option>
+                            <option value="720">Last 30 days</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Event Type</label>
+                        <select v-model="filters.event_type" @change="loadEvents" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                            <option value="">All Events</option>
+                            <option value="ValidatorCreated">Validator Created</option>
+                            <option value="Delegate">Delegate</option>
+                            <option value="Undelegate">Undelegate</option>
+                            <option value="Withdraw">Withdraw</option>
+                            <option value="ClaimRewards">Claim Rewards</option>
+                            <option value="ValidatorRewarded">Validator Rewarded</option>
+                            <option value="CommissionChanged">Commission Changed</option>
+                            <option value="EpochChanged">Epoch Changed</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Validator ID</label>
+                        <input v-model="filters.validator_id" @input="loadEvents" type="number" placeholder="Enter validator ID" class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Address</label>
+                        <input v-model="filters.address" @input="loadEvents" type="text" placeholder="0x..." class="w-full px-3 py-2 border border-gray-300 rounded-md">
+                    </div>
+                </div>
+            </div>
+
+            <!-- Events Table -->
+            <div class="bg-white rounded-lg shadow overflow-hidden">
+                <div class="px-6 py-4 border-b border-gray-200">
+                    <h2 class="text-xl font-bold text-gray-900">Events</h2>
+                    <p class="text-sm text-gray-500 mt-1" v-text="(eventsData.total || 0) + ' events found'"></p>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="min-w-full divide-y divide-gray-200">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Event</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Validator</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Amount</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Block</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tx Hash</th>
+                            </tr>
+                        </thead>
+                        <tbody class="bg-white divide-y divide-gray-200">
+                            <tr v-for="event in eventsData.events" :key="event.id" class="hover:bg-gray-50">
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" v-text="formatTime(event.timestamp)"></td>
+                                <td class="px-6 py-4 whitespace-nowrap">
+                                    <span :class="getEventBadgeClass(event.event_name)" class="px-2 py-1 text-xs font-semibold rounded-full" v-text="event.event_name"></span>
+                                </td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900" v-text="event.validator_id || '-'"></td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900" v-text="event.amount ? event.amount.toFixed(2) + ' MON' : '-'"></td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900" v-text="event.block_number"></td>
+                                <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 font-mono">
+                                    <a :href="'https://testnet.monadexplorer.com/tx/0x' + event.transaction_hash" target="_blank" class="text-blue-600 hover:text-blue-800" v-text="event.transaction_hash.substring(0, 10) + '...'"></a>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Pagination -->
+                <div class="px-6 py-4 border-t border-gray-200 flex items-center justify-between">
+                    <button @click="prevPage" :disabled="page <= 1" class="px-4 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed">
+                        Previous
+                    </button>
+                    <span class="text-sm text-gray-700" v-text="'Page ' + page + ' of ' + (eventsData.total_pages || 1)"></span>
+                    <button @click="nextPage" :disabled="page >= eventsData.total_pages" class="px-4 py-2 bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed">
+                        Next
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp } = Vue;
+
+        createApp({
+            data() {
+                return {
+                    stats: {},
+                    eventsData: { events: [], total: 0, total_pages: 0 },
+                    filters: {
+                        hours: '24',
+                        event_type: '',
+                        validator_id: '',
+                        address: ''
+                    },
+                    page: 1
+                }
+            },
+            mounted() {
+                this.loadStats();
+                this.loadEvents();
+                // Auto-refresh every 10 seconds
+                setInterval(() => {
+                    this.loadStats();
+                    this.loadEvents();
+                }, 10000);
+            },
+            methods: {
+                async loadStats() {
+                    const res = await fetch('/api/stats');
+                    this.stats = await res.json();
+                },
+                async loadEvents() {
+                    this.page = 1;
+                    await this.fetchEvents();
+                },
+                async fetchEvents() {
+                    const params = new URLSearchParams({
+                        page: this.page,
+                        per_page: 50,
+                        hours: this.filters.hours
+                    });
+                    if (this.filters.event_type) params.append('event_type', this.filters.event_type);
+                    if (this.filters.validator_id) params.append('validator_id', this.filters.validator_id);
+                    if (this.filters.address) params.append('address', this.filters.address);
+
+                    const res = await fetch('/api/events?' + params);
+                    this.eventsData = await res.json();
+                },
+                async nextPage() {
+                    if (this.page < this.eventsData.total_pages) {
+                        this.page++;
+                        await this.fetchEvents();
+                    }
+                },
+                async prevPage() {
+                    if (this.page > 1) {
+                        this.page--;
+                        await this.fetchEvents();
+                    }
+                },
+                formatTime(timestamp) {
+                    const date = new Date(timestamp);
+                    return date.toLocaleString();
+                },
+                getEventBadgeClass(eventName) {
+                    const classes = {
+                        'ValidatorCreated': 'bg-blue-100 text-blue-800',
+                        'Delegate': 'bg-green-100 text-green-800',
+                        'Undelegate': 'bg-yellow-100 text-yellow-800',
+                        'Withdraw': 'bg-red-100 text-red-800',
+                        'ClaimRewards': 'bg-purple-100 text-purple-800',
+                        'ValidatorRewarded': 'bg-indigo-100 text-indigo-800',
+                        'CommissionChanged': 'bg-orange-100 text-orange-800',
+                        'EpochChanged': 'bg-pink-100 text-pink-800'
+                    };
+                    return classes[eventName] || 'bg-gray-100 text-gray-800';
+                }
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+*.md
+docs/
+
+# Tests
+tests/
+test_*.py
+*_test.py
+
+# Git
+.git/
+.gitignore
+
+# CSV/JSON exports
+*.csv
+*.json
+
+# Config files
+config.toml
+*.env
+
+# Kubernetes
+k8s/
+*.yaml
+*.yml
+
+# Build
+dist/
+build/
+*.egg-info/

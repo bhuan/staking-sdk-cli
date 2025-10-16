@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monad-staking
+  labels:
+    app: monad-event-listener
+    environment: production
